@@ -1,0 +1,97 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jul  1 10:32:15 2025
+
+@author: USER
+"""
+# Step 01 : Import Libraries
+import pandas as pd
+from sqlalchemy import create_engine
+
+# Step 02 : PostgreSQL Connection
+user = 'fsuser'
+password = 'ulama%40123'
+host = '10.30.15.112'
+port = '5432'
+db = 'food_sec_db'
+
+connection_str = f'postgresql://{user}:{password}@{host}:{port}/{db}'
+engine = create_engine(connection_str)
+
+# Step 03 : Load weekly price for all items and price types
+query = """
+SELECT
+    item_id,
+    pr_type_id,
+    pr_date::date as ds,
+    price as y
+FROM
+    food_data.price
+ORDER BY
+    item_id, pr_type_id, pr_date;
+"""
+df = pd.read_sql(query, engine)
+
+# Preview the data
+print(df.head())
+print(f" {df['item_id'].nunique()} items and {df['pr_type_id'].nunique()} price types found.")
+
+from prophet import Prophet
+import pandas as pd
+from sqlalchemy import create_engine
+from tqdm import tqdm
+
+
+# ✅ Forecast each (item_id + pr_type_id)
+results = []
+group_keys = df[['item_id', 'pr_type_id']].drop_duplicates()
+
+for _, row in tqdm(group_keys.iterrows(), total=len(group_keys), desc="Forecasting..."):
+    item = row['item_id']
+    price_type = row['pr_type_id']
+    
+    group_df = df[(df['item_id'] == item) & (df['pr_type_id'] == price_type)][['ds', 'y']].copy()
+    
+    # Ensure 'ds' is datetime
+    group_df['ds'] = pd.to_datetime(group_df['ds'])
+    
+    if len(group_df) < 52:
+        continue  # skip if not enough data
+
+    try:
+        model = Prophet()
+        model.fit(group_df)
+
+        future = model.make_future_dataframe(periods=12, freq='W')
+        forecast = model.predict(future)
+
+        # ✅ Combine historical + forecast
+        historical = group_df.copy()
+        historical['is_forecast'] = False
+        historical['item_id'] = item
+        historical['pr_type_id'] = price_type
+
+        predicted = forecast[['ds', 'yhat']].copy()
+        cutoff_date = pd.to_datetime(group_df['ds'].max())
+        predicted = predicted[predicted['ds'] > cutoff_date]
+        predicted.rename(columns={'yhat': 'y'}, inplace=True)
+        predicted['is_forecast'] = True
+        predicted['item_id'] = item
+        predicted['pr_type_id'] = price_type
+
+        full = pd.concat([historical, predicted])
+        results.append(full)
+    
+    except Exception as e:
+        print(f"❌ Failed: item {item}, type {price_type}: {e}")
+        
+
+# ✅ Combine all and write to PostgreSQL
+if results:
+    final_df = pd.concat(results).reset_index(drop=True)
+    #final_df.to_sql('weekly_price_forecast', engine, if_exists='replace', index=False)
+    print("✅ Forecasting complete and saved to 'weekly_price_forecast' table.")
+else:
+    print("⚠️ No forecasts generated. Check logs above for errors.")
+
+final_df.to_csv('weekly_price_forecast.csv', index=False)
